@@ -20,28 +20,36 @@ ROAD_TYPES_TO_DOWLOAD = {
     "secondary_link",
     "tertiary",
     "tertiary_link",
+    "residential",  # delete for big map
+    "living_street", # delete for big map
 }
 
 OUTPUT_FILE_NAME = "test_map.html"
-DOWNLOAD_MODE = False
-
+DOWNLOAD_MODE = True
+PLACE = "Gyumri, Armenia"
+ORIGIN = "Vardanants Square 1, Gyumri, Armenia"
+DESTINATION = "Ghandilyan Street 1, Gyumri, Armenia"
 
 def download_roads():
-    def edge_is_major(row) -> bool:
-        hw = row.get("highway", None)
-        if hw is None:
-            return False
-        if isinstance(hw, str):
-            return hw in ROAD_TYPES_TO_DOWLOAD
-        return any(h in ROAD_TYPES_TO_DOWLOAD for h in hw)
+    # def edge_is_major(row) -> bool:
+    #     hw = row.get("highway", None)
+    #     if hw is None:
+    #         return False
+    #     if isinstance(hw, str):
+    #         return hw in ROAD_TYPES_TO_DOWLOAD
+    #     return any(h in ROAD_TYPES_TO_DOWLOAD for h in hw)
 
-    graph = ox.graph_from_place("Armenia", network_type="drive")
+    # graph = ox.graph_from_place(PLACE, network_type="drive")
+    # nodes, edges = ox.graph_to_gdfs(graph, nodes=True, edges=True)
+    # filtered_edges = edges[edges.apply(edge_is_major, axis=1)]
+    # edge_keys = list(filtered_edges.index)
+    # graph_filtered = graph.edge_subgraph(edge_keys).copy()
+    # nodes_filtered, edges_filtered = ox.graph_to_gdfs(graph_filtered, nodes=True, edges=True)
+    # return graph_filtered, nodes_filtered, edges_filtered
+    # temporary fix
+    graph = ox.graph_from_place(PLACE, network_type="drive")
     nodes, edges = ox.graph_to_gdfs(graph, nodes=True, edges=True)
-    filtered_edges = edges[edges.apply(edge_is_major, axis=1)]
-    edge_keys = list(filtered_edges.index)
-    graph_filtered = graph.edge_subgraph(edge_keys).copy()
-    nodes_filtered, edges_filtered = ox.graph_to_gdfs(graph_filtered, nodes=True, edges=True)
-    return graph_filtered, nodes_filtered, edges_filtered
+    return graph, nodes, edges
 
 
 def load_graph(path):
@@ -51,7 +59,7 @@ def load_graph(path):
 
 
 def download_charging_stations():
-    return ox.features_from_place("Armenia", tags={"amenity": "charging_station"})
+    return ox.features_from_place(PLACE, tags={"amenity": "charging_station"})
 
 
 def create_map(nodes, edges, stations):
@@ -79,25 +87,73 @@ def create_map(nodes, edges, stations):
     return map
 
 
-def create_path(map, graph, nodes, stations):
-    stations_df = stations[stations.geometry.type == "Point"].copy()
-    s1 = stations_df.iloc[0]
-    s2 = stations_df.iloc[1]
-    lon1, lat1 = s1.geometry.x, s1.geometry.y
-    lon2, lat2 = s2.geometry.x, s2.geometry.y
+def create_path(map_obj, graph, nodes, stations, from_address, to_address):
+    lat1, lon1 = ox.geocode(from_address)
+    lat2, lon2 = ox.geocode(to_address)
 
     from_node, to_node = ox.distance.nearest_nodes(
         graph, X=[lon1, lon2], Y=[lat1, lat2]
     )
+
+    # real geocoded points
+    folium.Marker(
+        [lat1, lon1],
+        popup="Origin geocoded",
+        icon=folium.Icon(color="blue"),
+    ).add_to(map_obj)
+
+    folium.Marker(
+        [lat2, lon2],
+        popup="Destination geocoded",
+        icon=folium.Icon(color="green"),
+    ).add_to(map_obj)
+
+    # snapped graph nodes
+    folium.CircleMarker(
+        [nodes.loc[from_node].y, nodes.loc[from_node].x],
+        radius=6,
+        color="darkblue",
+        fill=True,
+        popup="Origin snapped node",
+    ).add_to(map_obj)
+
+    folium.CircleMarker(
+        [nodes.loc[to_node].y, nodes.loc[to_node].x],
+        radius=6,
+        color="darkgreen",
+        fill=True,
+        popup="Destination snapped node",
+    ).add_to(map_obj)
+
     route = nx.shortest_path(graph, source=from_node, target=to_node, weight="length")
     route_coords = [(nodes.loc[n].y, nodes.loc[n].x) for n in route]
+
     folium.PolyLine(
         locations=route_coords,
         weight=5,
         color="orange",
         opacity=0.8,
         tooltip="Path",
-    ).add_to(map)
+    ).add_to(map_obj)
+
+    # optional: draw connectors from real points to snapped nodes
+    folium.PolyLine(
+        locations=[[lat1, lon1], [nodes.loc[from_node].y, nodes.loc[from_node].x]],
+        weight=2,
+        color="blue",
+        opacity=0.6,
+        dash_array="5, 5",
+        tooltip="Origin snap",
+    ).add_to(map_obj)
+
+    folium.PolyLine(
+        locations=[[lat2, lon2], [nodes.loc[to_node].y, nodes.loc[to_node].x]],
+        weight=2,
+        color="green",
+        opacity=0.6,
+        dash_array="5, 5",
+        tooltip="Destination snap",
+    ).add_to(map_obj)
 
 
 def add_travel_time_to_nodes(graph, default_speed_limit=60):
@@ -116,10 +172,7 @@ def add_travel_time_to_nodes(graph, default_speed_limit=60):
             # except:
             #     speed_limit = default_speed_limit
         
-        speed_limit_mps = speed_limit / 3.6
-        if speed_limit_mps:
-            raise ValueError(f"speed limit is {speed_limit_mps} at node")
-        
+        speed_limit_mps = speed_limit / 3.6        
         data["energy_consumption"] = length / speed_limit_mps
 
 
@@ -132,7 +185,7 @@ def add_energy_consumption_to_nodes(graph, default_energy_consumption=0.25):
 
 
 def expand_graph(graph, stations_df):
-    H = nx.DiGraph()
+    expanded_graph = nx.DiGraph()
     battery_capacity = 100  # TODO convert to Kw/h
     charging_nodes = set()
     for _, row in stations_df.iterrows():
@@ -141,10 +194,10 @@ def expand_graph(graph, stations_df):
         lon, lat = row.geometry.x, row.geometry.y
         node = ox.distance.nearest_nodes(graph, X=[lon], Y=[lat])[0]
         charging_nodes.add(node)
-    add_travel_time_to_nodes(graph, default_speed_kph=60)
+    add_travel_time_to_nodes(graph, default_speed_limit=60)
     add_energy_consumption_to_nodes(graph)
     for u, v, key, data in graph.edges(keys=True, data=True):
-        energy = data["energy"]
+        energy = data["energy_consumption"]
         travel_time = data["travel_time"]
         # discretizations
         # TODO add good system for discretization, maybe should be adaptive to the length of graph
@@ -155,7 +208,7 @@ def expand_graph(graph, stations_df):
         for k in range(delta_k, battery_capacity + 1):
             src = (u, k)
             dst = (v, k - delta_k)
-            H.add_edge(src, dst, time=travel_time)
+            expanded_graph.add_edge(src, dst, time=travel_time)
     
     charge_step = 1  
     charge_time_per_step = 10
@@ -163,7 +216,9 @@ def expand_graph(graph, stations_df):
         for k in range(0, battery_capacity - charge_step + 1):
             src = (v, k)
             dst = (v, k + charge_step)
-            H.add_edge(src, dst, time=charge_time_per_step)
+            expanded_graph.add_edge(src, dst, time=charge_time_per_step)
+    
+    return expanded_graph
 
 
 
@@ -183,7 +238,7 @@ def main():
         stations = gpd.read_file(save_path_stations)
 
     fmap = create_map(nodes, edges, stations)
-    create_path(fmap, graph, nodes, stations)
+    create_path(fmap, graph, nodes, stations, ORIGIN, DESTINATION)
 
 
     fmap.save(save_path_map)
